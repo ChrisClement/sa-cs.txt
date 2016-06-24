@@ -1,0 +1,1983 @@
+Everything starting with I is an interface to an object
+You'll mostly be interested in those
+Also trace the flow from where Form1 calls TestRunner.Run()
+
+
+cli-
+using System;
+using Core.AudioAnalysis;
+using SignalAnalyzer.Properties;
+using Core.BinaryFskAnalysis;
+using SignalAnalyzer.Ui;
+using Core.AudioGeneration;
+using Core.BinaryData;
+using System.IO;
+using System.Diagnostics;
+
+namespace Cli
+{
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            var bitManipulator = new BitManipulator();
+            var myBits = bitManipulator.StringToBits(Resources.BigLebowskiQuote);
+            Console.WriteLine($"Length of string in bits: {myBits.Count}");
+
+            var audioStream = new MemoryStream();
+
+            var binaryFskAnalyzerSettings = new Bell103BinaryFskAnalyzerSettings();
+
+            var audioGenerator = new AudioGenerator(audioStream);
+            var fskAudioGenerator = new FskAudioGenerator(audioGenerator);
+            fskAudioGenerator.GenerateAudio(binaryFskAnalyzerSettings.BaudRate,
+                binaryFskAnalyzerSettings.SpaceFrequency, binaryFskAnalyzerSettings.MarkFrequency, myBits);
+
+            var audioLengthInMillisecondsSeconds = (int)(myBits.Count * 1000.0 / binaryFskAnalyzerSettings.BaudRate);
+            Console.WriteLine($"Length of audio in seconds: {audioLengthInMillisecondsSeconds / 1000.0:N1}");
+            Console.WriteLine();
+
+            Console.WriteLine(Resources.BigLebowskiQuote);
+            Console.WriteLine();
+
+            AudioAnalyzer.Play(audioStream, audioLengthInMillisecondsSeconds);
+
+            audioGenerator = new AudioGenerator(audioStream);
+            fskAudioGenerator = new FskAudioGenerator(audioGenerator);
+            fskAudioGenerator.GenerateAudio(binaryFskAnalyzerSettings.BaudRate,
+                binaryFskAnalyzerSettings.SpaceFrequency, binaryFskAnalyzerSettings.MarkFrequency, myBits);
+
+            var binaryFskAnalyzer = new BinaryFskAnalyzer(new AudioAnalyzer(audioStream, audioGenerator), new ZeroCrossingsFrequencyDetector(), binaryFskAnalyzerSettings);
+
+            Console.WriteLine($"Window position start {binaryFskAnalyzerSettings.WindowPositionStartMilliseconds:N3} ms, window position end {binaryFskAnalyzerSettings.WindowPositionEndMilliseconds:N3} ms, window position increment {binaryFskAnalyzerSettings.WindowPositionIncrementMilliseconds:N3} ms");
+            Console.WriteLine($"Window length start {binaryFskAnalyzerSettings.WindowLengthStartMilliseconds:N3} ms, window length end {binaryFskAnalyzerSettings.WindowLengthEndMilliseconds:N3} ms, window length increment {binaryFskAnalyzerSettings.WindowLengthIncrementMilliseconds:N3} ms");
+            Console.WriteLine();
+
+            var bits = binaryFskAnalyzer.AnalyzeSignal();
+
+            Console.WriteLine("Rendering bytes");
+            Console.WriteLine();
+            var renderer = (IRenderer)new RowRenderer();
+            renderer.Render(BitManipulator.BitsToBytes(bits));
+            Console.WriteLine();
+            Console.WriteLine();
+
+            Console.WriteLine("Rendering ASCII");
+            Console.WriteLine();
+            renderer = new AsciiRenderer();
+            renderer.Render(BitManipulator.BitsToBytes(bits));
+            Console.WriteLine();
+
+            Console.WriteLine("Done");
+            Console.ReadLine();
+        }
+    }
+}
+xxxxxxxxxxxxxxxxxxxxxxxx
+namespace Core.SignalAnalysis
+{
+    public class FrequencyComponent
+    {
+        public int Frequency { get; set; }
+        public double Magnitude { get; set; }
+        public int BinNumber { get; set; }
+    }
+}
+---
+using System.Collections.Generic;
+
+namespace Core.SignalAnalysis
+{
+    public interface ISignalAnalyzer
+    {
+        SignalAnalysisResult AnalyzeSignal(double? startMilliseconds = null,
+            double? endMilliseconds = null, int minFftSize = 8192, int maxFftSize = 16384);
+
+        ICollection<int> GetFrequencyCandidates(string filename,
+            int windowPositionStart, int windowPositionEnd, int windowLengthStart, int windowLengthEnd,
+            int numberOfClusters = 10, int cutoffFrequency = 4000);
+    }
+}
+---
+using Core.AudioAnalysis;
+using System.Collections.Generic;
+using System.Text;
+
+namespace Core.SignalAnalysis
+{
+    public class SignalAnalysisResult
+    {
+        public SamplingResult SamplingResult { get; set; }
+        public int NumberOfBins { get; set; }
+        public int BinSizeInHertz { get; set; }
+        public ICollection<FrequencyComponent> FrequencyComponents = new List<FrequencyComponent>();
+
+        public override string ToString()
+        {
+            var fileLengthInBytes = SamplingResult != null ? SamplingResult.FileLengthInBytes : 0;
+            var fileLengthInMilliseconds = SamplingResult != null ? SamplingResult.FileLengthInMilliseconds : 0;
+            var sampleRate = SamplingResult != null ? SamplingResult.SampleRate : 0;
+            var bitsPerSample = SamplingResult != null ? SamplingResult.BitsPerSample : 0;
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"File length in bytes: {fileLengthInBytes:N0} bytes");
+            sb.AppendLine($"File length in milliseconds: {fileLengthInMilliseconds:N0} ms");
+            sb.AppendLine($"Sample rate: {sampleRate:N0} Hz");
+            sb.AppendLine($"Bits per sample: {bitsPerSample:N0} bits/sample");
+            sb.AppendLine($"# bins: {NumberOfBins:N0}");
+            sb.AppendLine($"Bin size in Hertz: {BinSizeInHertz:N0} Hertz");
+            return sb.ToString();
+        }
+    }
+}
+---
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using MathNet.Numerics;
+using MathNet.Numerics.IntegralTransforms;
+using Core.AudioAnalysis;
+using Accord.MachineLearning;
+using System.Linq;
+
+namespace Core.SignalAnalysis
+{
+    public class SignalAnalyzer : ISignalAnalyzer
+    {
+        private IAudioAnalyzer _audioAnalyzer;
+
+        public SignalAnalyzer(IAudioAnalyzer audioAnalyzer)
+        {
+            if (audioAnalyzer == null)
+            {
+                throw new ArgumentNullException(nameof(audioAnalyzer));
+            }
+
+            _audioAnalyzer = audioAnalyzer;
+        }
+
+        public SignalAnalysisResult AnalyzeSignal(double? startMilliseconds,
+            double? endMilliseconds, int minFftSize, int maxFftSize)
+        {
+            if ((startMilliseconds != null && endMilliseconds == null) || (startMilliseconds == null && endMilliseconds != null))
+            {
+                throw new ArgumentOutOfRangeException("startMilliseconds and endMilliseconds must be either both null or both not null", (Exception)null);
+            }
+
+            if (startMilliseconds != null && endMilliseconds != null && endMilliseconds <= startMilliseconds)
+            {
+                throw new ArgumentOutOfRangeException($"endMilliseconds ({endMilliseconds}) must be greater than startMilliseconds ({startMilliseconds})", (Exception)null);
+            }
+
+            var samplingResult = _audioAnalyzer.GetSamples(startMilliseconds, endMilliseconds);
+
+            int fftSize = NextPowerOfTwo(samplingResult.Samples.Count, minFftSize, maxFftSize);
+
+            var window = Window.Hann(fftSize);
+
+            var complexes = new Complex[fftSize];
+            for (var i = 0; i < (fftSize > samplingResult.Samples.Count ? samplingResult.Samples.Count : fftSize); i++)
+            {
+                complexes[i] = new Complex(samplingResult.Samples[i] * window[i], 0);
+            }
+
+            Fourier.Forward(complexes);
+
+            var frequencyComponents = new List<FrequencyComponent>();
+            for (var i = 1; i < complexes.Length / 2; i++)
+            {
+                var freq = i * samplingResult.SampleRate / complexes.Length;
+
+                var frequencyComponent = new FrequencyComponent
+                {
+                    Frequency = freq,
+                    Magnitude = complexes[i].Magnitude,
+                    BinNumber = i
+                };
+
+                frequencyComponents.Add(frequencyComponent);
+            }
+
+            frequencyComponents.Sort((a, b) => b.Magnitude.CompareTo(a.Magnitude));
+
+            return new SignalAnalysisResult
+            {
+                SamplingResult = samplingResult,
+                NumberOfBins = fftSize,
+                BinSizeInHertz = samplingResult.SampleRate / fftSize,
+                FrequencyComponents = frequencyComponents
+            };
+        }
+
+        public ICollection<int> GetFrequencyCandidates(string filename,
+            int windowPositionStart, int windowPositionEnd, int windowLengthStart, int windowLengthEnd,
+            int numberOfClusters, int cutoffFrequency)
+        {
+            if (string.IsNullOrEmpty(filename))
+            {
+                throw new ArgumentNullException(nameof(filename), "filename must not be null or empty");
+            }
+
+            var frequencyComponents = new List<FrequencyComponent>();
+
+            for (var currentWindowStart = windowPositionStart; currentWindowStart <= windowPositionEnd; currentWindowStart++)
+            {
+                for (var currentWindowLength = windowLengthStart; currentWindowLength <= windowLengthEnd; currentWindowLength++)
+                {
+                    var signalAnalysisResult = ((ISignalAnalyzer)this).AnalyzeSignal(currentWindowStart, currentWindowStart + currentWindowLength);
+
+                    frequencyComponents.Add(signalAnalysisResult.FrequencyComponents.First());
+                }
+            }
+
+            return GetFrequencyCandidates(frequencyComponents);
+        }
+
+        private static ICollection<int> GetFrequencyCandidates(IList<FrequencyComponent> frequencyComponents,
+            int numberOfClusters = 10, int cutoffFrequency = 4000)
+        {
+            var filteredFrequencyComponents = frequencyComponents.Where(y => y.Frequency <= cutoffFrequency).ToList();
+
+            var weightedFrequencies = WeightFrequencyComponents(filteredFrequencyComponents);
+
+            var observations = weightedFrequencies.Select(x => new double[] { x }).ToArray();
+
+            var kMeans = new KMeans(numberOfClusters);
+            kMeans.Compute(observations);
+            return kMeans.Clusters.Select(x => (int)x.Mean[0]).ToList();
+        }
+
+        private static ICollection<double> WeightFrequencyComponents(ICollection<FrequencyComponent> frequencyComponents,
+            int magnitudeDivisonFactor = 10)
+        {
+            var weightedFrequencies = new List<double>();
+
+            foreach (var frequencyComponent in frequencyComponents)
+            {
+                for (int i = 0; i < frequencyComponent.Magnitude / magnitudeDivisonFactor; i++)
+                {
+                    weightedFrequencies.Add(frequencyComponent.Frequency);
+                }
+            }
+
+            return weightedFrequencies;
+        }
+
+        private static int NextPowerOfTwo(int n, int minPowerOfTwo, int maxPowerOfTwo)
+        {
+            int powerOfTwo = minPowerOfTwo;
+
+            for (var i = 1; i <= n; i++)
+            {
+                if (i > powerOfTwo)
+                {
+                    powerOfTwo = powerOfTwo * 2;
+                }
+
+                if (i == maxPowerOfTwo)
+                {
+                    break;
+                }
+            }
+
+            return powerOfTwo;
+        }
+    }
+}
+------
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
+// General Information about an assembly is controlled through the following 
+// set of attributes. Change these attribute values to modify the information
+// associated with an assembly.
+[assembly: AssemblyTitle("Core")]
+[assembly: AssemblyDescription("")]
+[assembly: AssemblyConfiguration("")]
+[assembly: AssemblyCompany("")]
+[assembly: AssemblyProduct("Core")]
+[assembly: AssemblyCopyright("Copyright ©  2016")]
+[assembly: AssemblyTrademark("")]
+[assembly: AssemblyCulture("")]
+
+// Setting ComVisible to false makes the types in this assembly not visible 
+// to COM components.  If you need to access a type in this assembly from 
+// COM, set the ComVisible attribute to true on that type.
+[assembly: ComVisible(false)]
+
+// The following GUID is for the ID of the typelib if this project is exposed to COM
+[assembly: Guid("29d3ca05-7f96-4750-ba4d-b995d5389ac8")]
+
+// Version information for an assembly consists of the following four values:
+//
+//      Major Version
+//      Minor Version 
+//      Build Number
+//      Revision
+//
+// You can specify all the values or you can default the Build and Revision Numbers 
+// by using the '*' as shown below:
+// [assembly: AssemblyVersion("1.0.*")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
+------
+namespace Core.BinaryFskAnalysis
+{
+    public class Bell103BinaryFskAnalyzerSettings : BinaryFskAnalyzerSettings
+    {
+        public Bell103BinaryFskAnalyzerSettings()
+        {
+            BaudRate = 300.0;
+            SpaceFrequency = 1070;
+            MarkFrequency = 1270;
+        }
+    }
+}
+---
+namespace Core.BinaryFskAnalysis
+{
+    public class Bell202BinaryFskAnalyzerSettings : BinaryFskAnalyzerSettings
+    {
+        public Bell202BinaryFskAnalyzerSettings()
+        {
+            BaudRate = 1200.0;
+            SpaceFrequency = 2200;
+            MarkFrequency = 1200;
+        }
+    }
+}
+---
+using System.Collections.Generic;
+using System;
+using System.Diagnostics;
+using Core.AudioAnalysis;
+using System.Linq;
+using Core.BinaryData;
+
+namespace Core.BinaryFskAnalysis
+{
+    public class BinaryFskAnalyzer : BinaryFskAnalyzerEventSource, IBinaryFskAnalyzer
+    {
+        private IAudioAnalyzer _audioAnalyzer;
+        private IFrequencyDetector _frequencyDetector;
+        private BinaryFskAnalyzerSettings _settings;
+
+        public BinaryFskAnalyzer(IAudioAnalyzer audioAnalyzer, IFrequencyDetector frequencyDetector,
+            BinaryFskAnalyzerSettings binaryFskAnalzyerSettings)
+        {
+            Initialize(audioAnalyzer, frequencyDetector, binaryFskAnalzyerSettings);
+        }
+
+        public void Initialize(IAudioAnalyzer audioAnalyzer, IFrequencyDetector frequencyDetector,
+            BinaryFskAnalyzerSettings binaryFskAnalzyerSettings)
+        {
+            if (audioAnalyzer == null)
+            {
+                throw new ArgumentNullException(nameof(audioAnalyzer));
+            }
+
+            if (frequencyDetector == null)
+            {
+                throw new ArgumentNullException(nameof(frequencyDetector));
+            }
+
+            if (binaryFskAnalzyerSettings == null)
+            {
+                throw new ArgumentNullException(nameof(binaryFskAnalzyerSettings));
+            }
+
+            _audioAnalyzer = audioAnalyzer;
+            _frequencyDetector = frequencyDetector;
+            _settings = ProcessSettings(binaryFskAnalzyerSettings);
+        }
+
+        public ICollection<bool> AnalyzeSignal(string testString = null)
+        {
+            var bits = new List<bool>();
+
+            var numberOfFrequencyDifferences = new List<int>();
+            int numberOfMissedFrequencies = 0;
+
+            if (_settings.WindowPositionEndMilliseconds == null)
+            {
+                _settings.WindowPositionEndMilliseconds = _audioAnalyzer.FileLengthInMilliseconds;
+
+                // Debug.WriteLine($"No window end position specified, setting to total length of audio ({_settings.WindowPositionEndMilliseconds} ms)");
+            }
+
+            for (var currentWindowStart = _settings.WindowPositionStartMilliseconds; currentWindowStart <= _settings.WindowPositionEndMilliseconds; currentWindowStart += _settings.WindowPositionIncrementMilliseconds.Value)
+            {
+                for (var currentWindowLength = _settings.WindowLengthStartMilliseconds; currentWindowLength <= _settings.WindowLengthEndMilliseconds; currentWindowLength += _settings.WindowLengthIncrementMilliseconds)
+                {
+                    var samplingResult = _audioAnalyzer.GetSamples(currentWindowStart, currentWindowStart + currentWindowLength);
+                    var frequency = _frequencyDetector.DetectFrequency(samplingResult.Samples);
+                    var frequencyDifference = FrequencyDifference(frequency, _settings.SpaceFrequency, _settings.MarkFrequency);
+                    var markOrSpace = MarkOrSpace(frequency, _settings.SpaceFrequency, _settings.MarkFrequency);
+
+                    if (frequencyDifference > _settings.FrequencyDeviationTolerance)
+                    {
+                        // Debug.WriteLine($"WARN: Frequency outside of tolerance (frequency {frequency} Hz, difference {frequencyDifference} Hz, tolerance {_settings.FrequencyDeviationTolerance} Hz)");
+                        numberOfMissedFrequencies++;
+                        continue;
+                    }
+
+                    // Debug.WriteLine($"[{currentWindowStart:N3} ms to {currentWindowStart + currentWindowLength:N3} ms ({(currentWindowStart + currentWindowLength) - currentWindowStart:N3} ms)] {frequency:N0} Hz average (+/- {frequencyDifference:N0} Hz) [Want {_settings.MarkFrequency:N0} Hz / {_settings.SpaceFrequency:N0} Hz] -> bit {bits.Count}: {markOrSpace}");
+                    numberOfFrequencyDifferences.Add(frequencyDifference);
+
+                    bits.Add(markOrSpace == 0 ? false : true);
+                }
+            }
+
+            var averageFrequencyDifference = numberOfFrequencyDifferences.Count() > 0 ? numberOfFrequencyDifferences.Average() : 0;
+
+            bool? match = null;
+            string resultingString = null;
+            if (testString != null)
+            {
+                resultingString = BitManipulator.BitsToString(bits);
+                match = false;
+                if (resultingString == testString)
+                {
+                    match = true;
+                }
+            }
+
+            // Debug.WriteLine($"Boost freq.: {_audioAnalyzer.BoostFrequencyAmount} Hz, avg. freq. diff.: {averageFrequencyDifference}, # missed freqs.: {missedFrequencies}");
+
+            AnalysisComplete(_audioAnalyzer.BoostFrequencyAmount, averageFrequencyDifference, numberOfMissedFrequencies, resultingString, match);
+
+            return bits;
+        }
+
+        private static int FrequencyDifference(int frequency, int spaceFrequency, int markFrequency)
+        {
+            int distanceFromSpaceFrequency = Math.Abs(frequency - spaceFrequency);
+            int distanceFromMarkFrequency = Math.Abs(frequency - markFrequency);
+
+            return distanceFromSpaceFrequency <= distanceFromMarkFrequency ? distanceFromSpaceFrequency : distanceFromMarkFrequency;
+        }
+
+        private static int MarkOrSpace(int frequency, int spaceFrequency, int markFrequency)
+        {
+            int distanceFromSpaceFrequency = Math.Abs(frequency - spaceFrequency);
+            int distanceFromMarkFrequency = Math.Abs(frequency - markFrequency);
+
+            return distanceFromSpaceFrequency <= distanceFromMarkFrequency ? 0 : 1;
+        }
+
+        private BinaryFskAnalyzerSettings ProcessSettings(BinaryFskAnalyzerSettings sourceSettings)
+        {
+            var updatedSettings = new BinaryFskAnalyzerSettings(sourceSettings);
+
+            var baudRateIncrement = 1.0 / updatedSettings.BaudRate * 1000.0;
+
+            if (updatedSettings.WindowPositionIncrementMilliseconds == null)
+            {
+                updatedSettings.WindowPositionIncrementMilliseconds = baudRateIncrement;
+            }
+
+            if (updatedSettings.WindowLengthStartMilliseconds == null)
+            {
+                updatedSettings.WindowLengthStartMilliseconds = baudRateIncrement;
+            }
+
+            if (updatedSettings.WindowLengthIncrementMilliseconds == null)
+            {
+                updatedSettings.WindowLengthIncrementMilliseconds = 1.0;
+            }
+
+            if (updatedSettings.WindowLengthEndMilliseconds == null)
+            {
+                updatedSettings.WindowLengthEndMilliseconds = baudRateIncrement;
+            }
+
+            return updatedSettings;
+        }
+
+        private class WindowSample
+        {
+            public int Frequency { get; set; }
+            public int Distance { get; set; }
+            public int WindowStartPosition { get; set; }
+            public int WindowLength { get; set; }
+        }
+    }
+}
+---
+using System;
+
+namespace Core.BinaryFskAnalysis
+{
+    public class BinaryFskAnalyzerEventSource
+    {
+        public event AnalysisCompletedEventHandler AnalysisCompleted;
+
+        protected void AnalysisComplete(int boostFrequencyAmount, double averageFrequencyDifference, int numberOfMissedFrequencies,
+            string resultingString = null, bool? matched = null)
+        {
+            var e = new AnalysisResultEventArgs
+            {
+                BoostFrequencyAmount = boostFrequencyAmount,
+                AverageFrequencyDifference = averageFrequencyDifference,
+                NumberOfMissedFrequencies = numberOfMissedFrequencies,
+                ResultingString = resultingString,
+                Matched = matched
+            };
+
+            AnalysisCompleted?.Invoke(this, e);
+        }
+    }
+
+    public class AnalysisResultEventArgs : EventArgs
+    {
+        public int BoostFrequencyAmount { get; set; }
+        public double AverageFrequencyDifference { get; set; }
+        public int NumberOfMissedFrequencies { get; set; }
+        public string ResultingString { get; set; }
+        public bool? Matched { get; set; }
+    }
+}
+---
+namespace Core.BinaryFskAnalysis
+{
+    public class BinaryFskAnalyzerSettings
+    {
+        public double BaudRate { get; set; }
+        public int SpaceFrequency { get; set; }
+        public int MarkFrequency { get; set; }
+        public double WindowPositionStartMilliseconds { get; set; } = 0.0;
+        public double? WindowPositionIncrementMilliseconds { get; set; }
+        public double? WindowPositionEndMilliseconds { get; set; }
+        public double? WindowLengthStartMilliseconds { get; set; }
+        public double? WindowLengthIncrementMilliseconds { get; set; }
+        public double? WindowLengthEndMilliseconds { get; set; }
+        public double FrequencyDeviationTolerance { get; set; } = 20.0;
+
+        public BinaryFskAnalyzerSettings() {}
+
+        public BinaryFskAnalyzerSettings(BinaryFskAnalyzerSettings sourceSettings)
+        {
+            BaudRate = sourceSettings.BaudRate;
+            SpaceFrequency = sourceSettings.SpaceFrequency;
+            MarkFrequency = sourceSettings.MarkFrequency;
+            WindowPositionStartMilliseconds = sourceSettings.WindowPositionStartMilliseconds;
+            WindowPositionIncrementMilliseconds = sourceSettings.WindowPositionIncrementMilliseconds;
+            WindowPositionEndMilliseconds = sourceSettings.WindowPositionEndMilliseconds;
+            WindowLengthStartMilliseconds = sourceSettings.WindowLengthStartMilliseconds;
+            WindowLengthIncrementMilliseconds = sourceSettings.WindowLengthIncrementMilliseconds;
+            WindowLengthEndMilliseconds = sourceSettings.WindowLengthEndMilliseconds;
+            FrequencyDeviationTolerance = sourceSettings.FrequencyDeviationTolerance;
+        }
+    }
+}
+---
+using Accord.Math.Differentiation;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+
+namespace Core.BinaryFskAnalysis
+{
+    public class DerivativeFrequencyDetector : IFrequencyDetector
+    {
+        private double _sampleRate;
+
+        public DerivativeFrequencyDetector(double sampleRate = 88200.0)
+        {
+            _sampleRate = sampleRate;
+        }
+
+        public int DetectFrequency(IList<float> samples)
+        {
+            /*
+            def freq_from_der(sig, srate):
+            """Estimate frequency using by computing derivative
+                sig(2*pi*f *t + phi)' = 2 * pi * f * derivative(2*pi*f * sample / srate + phi)
+
+                f = (sig/derivative) *  srate / (2 * pi)
+            """
+            sig = np.array(sig,dtype=np.float64)
+            der = np.gradient(sig) # computer derivative of signal
+            rms_def = np.sqrt(np.mean(der**2)) # compute root mean squared of derivative
+            rms_sig = np.sqrt(np.mean(sig * sig)) # compute root mean squared of signal
+            freq = (srate / ( 2 * np.pi)) * (rms_def / rms_sig)
+            return freq
+            */
+
+            if (samples.Count() < 2)
+            {
+                return 0;
+            }
+
+            var gradient = new List<double>();
+            for (var i = 0; i < samples.Count(); i++)
+            {
+                if (i == 0) {
+                    gradient.Add(samples[i + 1] - samples[i]);
+                }
+                else if (i == samples.Count() - 1)
+                {
+                    gradient.Add(samples[i] - samples[i - 1]);
+                }
+	            else
+                {
+                    gradient.Add((samples[i + 1] - samples[i - 1]) / 2);
+                }
+            }
+
+            var gradientRms = Math.Sqrt(gradient.Select(x => Math.Pow(x, 2)).Average());
+            var samplesRms = Math.Sqrt(samples.Select(x => Math.Pow(x, 2)).Average());
+
+            var frequency = (_sampleRate / (2 * Math.PI)) * (gradientRms / samplesRms);
+
+            return (int)frequency;
+        }
+    }
+}
+---
+using Core.AudioAnalysis;
+using System.Collections.Generic;
+
+namespace Core.BinaryFskAnalysis
+{
+    public delegate void AnalysisCompletedEventHandler(object sender, AnalysisResultEventArgs e);
+
+    public interface IBinaryFskAnalyzer
+    {
+        ICollection<bool> AnalyzeSignal(string testString = null);
+        void Initialize(IAudioAnalyzer audioAnalyzer, IFrequencyDetector frequencyDetector,
+            BinaryFskAnalyzerSettings binaryFskAnalzyerSettings);
+        event AnalysisCompletedEventHandler AnalysisCompleted;
+    }
+}
+---
+using System.Collections.Generic;
+
+namespace Core.BinaryFskAnalysis
+{
+    public interface IFrequencyDetector
+    {
+        int DetectFrequency(IList<float> samples);
+    }
+}
+---
+using System.Collections.Generic;
+using System.Linq;
+
+namespace Core.BinaryFskAnalysis
+{
+    public class ZeroCrossingsFrequencyDetector : IFrequencyDetector
+    {
+        private SignChangeDetector _signChangeDetector;
+
+        public ZeroCrossingsFrequencyDetector(int sampleRate = 88200)
+        {
+            _signChangeDetector = new SignChangeDetector(sampleRate);
+        }
+
+        public int DetectFrequency(IList<float> samples)
+        {
+            var frequencies = new List<int>();
+
+            for (var sampleNumber = 0; sampleNumber < samples.Count; sampleNumber++)
+            {
+                var currentTimeMilliseconds = sampleNumber * 1.0 / _signChangeDetector.SampleRate * 1000.0;
+
+                var signChangeResult = _signChangeDetector.DetectSignChange(samples[sampleNumber], currentTimeMilliseconds);
+
+                if (signChangeResult.SignChanged == true && signChangeResult.TimeDifferenceMilliseconds != null)
+                {
+                    var frequency = (int)(1.0 / signChangeResult.TimeDifferenceMilliseconds * 1000.0);
+                    frequencies.Add(frequency);
+                }
+            }
+
+            _signChangeDetector.Reset();
+
+            return frequencies.Count > 0 ? (int)frequencies.Average() : 0;
+        }
+
+        private class SignChangeDetector
+        {
+            private int? _lastSign = null;
+            private double? _lastSignChangeMilliseconds { get; set; } = null;
+
+            public int SampleRate { get; }
+
+            public SignChangeDetector(int sampleRate)
+            {
+                SampleRate = sampleRate;
+            }
+
+            public SignChangeResult DetectSignChange(float sample, double currentTimeMilliseconds)
+            {
+                bool signChanged = false;
+
+                if (_lastSign != null && _lastSign == 1 && sample < 0)
+                {
+                    signChanged = true;
+                }
+
+                var signChangeResult = new SignChangeResult
+                {
+                    SignChanged = signChanged,
+                    TimeDifferenceMilliseconds = _lastSignChangeMilliseconds != null ? currentTimeMilliseconds - _lastSignChangeMilliseconds : null
+                };
+
+                if (signChanged == true)
+                {
+                    _lastSignChangeMilliseconds = currentTimeMilliseconds;
+                }
+
+                _lastSign = sample >= 0 ? 1 : -1;
+
+                return signChangeResult;
+            }
+
+            public void Reset()
+            {
+                _lastSign = null;
+                _lastSignChangeMilliseconds = null;
+            }
+        }
+
+        private class SignChangeResult
+        {
+            public bool SignChanged { get; set; } = false;
+            public double? TimeDifferenceMilliseconds { get; set; }
+        }
+    }
+}
+------
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Text;
+
+namespace Core.BinaryData
+{
+    public class BitManipulator
+    {
+        private Dictionary<char, List<bool>> _asciiTable;
+
+        public BitManipulator()
+        {
+            // TODO: Is there a better way to convert from chars to arrays of bools?
+            _asciiTable = GetAsciiTable();
+        }
+
+        public static ICollection<bool> RemoveLeftBits(ICollection<bool> bits, int numberOfBits)
+        {
+            if (bits == null)
+            {
+                throw new ArgumentNullException(nameof(bits));
+            }
+
+            var newBits = new List<bool>();
+
+            for (var i = 0; i < bits.Count(); i++)
+            {
+                if (i + 1 <= numberOfBits)
+                {
+                    continue;
+                }
+
+                newBits.Add(bits.ToList()[i]);
+            }
+
+            return newBits;
+        }
+
+        public static ICollection<bool> RemoveStartStopBits(ICollection<bool> bits)
+        {
+            if (bits == null)
+            {
+                throw new ArgumentNullException(nameof(bits));
+            }
+
+            var newBits = new List<bool>();
+
+            var bitNumber = 0;
+            for (var i = 0; i < bits.Count; i++)
+            {
+                bitNumber++;
+
+                if (bitNumber == 1)
+                {
+                    continue;
+                }
+
+                if (bitNumber == 10)
+                {
+                    bitNumber = 0;
+                    continue;
+                }
+
+                newBits.Add(bits.ToList()[i]);
+            }
+
+            return newBits;
+        }
+
+        public static List<List<bool>> BitsToBytes(ICollection<bool> bits)
+        {
+            if (bits == null)
+            {
+                throw new ArgumentNullException(nameof(bits));
+            }
+
+            var bytes = new List<List<bool>>();
+
+            foreach (var bit in bits.Select((value, index) => new { value, index }))
+            {
+                if (bit.index == 0 || bit.index % 8 == 0)
+                {
+                    bytes.Add(new List<bool>());
+                }
+
+                bytes.ElementAt(bytes.Count - 1).Add(bit.value);
+            }
+
+            return bytes;
+        }
+
+        public static ICollection<bool> RemoveBit(ICollection<bool> incomingBits, int bitNumber)
+        {
+            if (incomingBits == null)
+            {
+                throw new ArgumentNullException(nameof(incomingBits));
+            }
+
+            var bits = new List<bool>();
+
+            var n = 0;
+            foreach (var bit in incomingBits)
+            {
+                n++;
+
+                if (n == bitNumber)
+                {
+                    continue;
+                }
+
+                bits.Add(bit);
+            }
+
+            return bits;
+        }
+
+        public static List<bool> ChangeBit(List<bool> bits, int bitNumber, int newValue)
+        {
+            if (bits == null)
+            {
+                throw new ArgumentNullException(nameof(bits));
+            }
+
+            bits[bitNumber - 1] = (newValue == 1 ? true : false);
+            return bits;
+        }
+
+        public static char ByteToChar(List<bool> bits)
+        {
+            if (bits == null)
+            {
+                throw new ArgumentNullException(nameof(bits));
+            }
+
+            byte val = 0;
+            foreach (bool bit in bits)
+            {
+                val <<= 1;
+                if (bit) val |= 1;
+            }
+            return Convert.ToChar(val);
+        }
+
+        public static ICollection<bool> BitStringToBits(string bitString)
+        {
+            if (bitString == null)
+            {
+                throw new ArgumentNullException(nameof(bitString));
+            }
+
+            var bits = new List<bool>();
+
+            for (var i = 0; i < bitString.Length; i++)
+            {
+                if (bitString[i] != '0' && bitString[i] != '1')
+                {
+                    throw new ArgumentOutOfRangeException(nameof(bitString), "String must only contain 0s and 1s");
+                }
+
+                if (bitString[i] == '0')
+                {
+                    bits.Add(false);
+                }
+                else
+                {
+                    bits.Add(true);
+                }
+            }
+
+            return bits;
+        }
+
+        public ICollection<bool> StringToBits(string inputString)
+        {
+            if (inputString == null)
+            {
+                throw new ArgumentNullException(nameof(inputString));
+            }
+
+            var bits = new List<bool>();
+
+            for (var i = 0; i < inputString.Length; i++)
+            {
+                if (! _asciiTable.ContainsKey(inputString[i]))
+                {
+                    Debug.WriteLine($"WARN: Could not find ASCII bits for character [{inputString[i]}] at index {i}");
+                    continue;
+                }
+
+                _asciiTable[inputString[i]].ForEach(bit => bits.Add(bit));
+            }
+
+            return bits;
+        }
+
+        public static string BitsToString(ICollection<bool> bits)
+        {
+            var outgoingBytes = BitsToBytes(bits);
+            var outgoingString = new StringBuilder();
+
+            foreach (var outgoingByte in outgoingBytes)
+            {
+                outgoingString.Append(ByteToChar(outgoingByte));
+            }
+
+            return outgoingString.ToString();
+        }
+
+        private Dictionary<char, List<bool>> GetAsciiTable()
+        {
+            return new Dictionary<char, List<bool>>
+            {
+                {' ',new List<bool>{false,false,true,false,false,false,false,false}},
+                {'!',new List<bool>{false,false,true,false,false,false,false,true}},
+                {'"',new List<bool>{false,false,true,false,false,false,true,false}},
+                {'#',new List<bool>{false,false,true,false,false,false,true,true}},
+                {'$',new List<bool>{false,false,true,false,false,true,false,false}},
+                {'%',new List<bool>{false,false,true,false,false,true,false,true}},
+                {'&',new List<bool>{false,false,true,false,false,true,true,false}},
+                {'\'',new List<bool>{false,false,true,false,false,true,true,true}},
+                {'(',new List<bool>{false,false,true,false,true,false,false,false}},
+                {')',new List<bool>{false,false,true,false,true,false,false,true}},
+                {'*',new List<bool>{false,false,true,false,true,false,true,false}},
+                {'+',new List<bool>{false,false,true,false,true,false,true,true}},
+                {',',new List<bool>{false,false,true,false,true,true,false,false}},
+                {'-',new List<bool>{false,false,true,false,true,true,false,true}},
+                {'.',new List<bool>{false,false,true,false,true,true,true,false}},
+                {'/',new List<bool>{false,false,true,false,true,true,true,true}},
+                {'0',new List<bool>{false,false,true,true,false,false,false,false}},
+                {'1',new List<bool>{false,false,true,true,false,false,false,true}},
+                {'2',new List<bool>{false,false,true,true,false,false,true,false}},
+                {'3',new List<bool>{false,false,true,true,false,false,true,true}},
+                {'4',new List<bool>{false,false,true,true,false,true,false,false}},
+                {'5',new List<bool>{false,false,true,true,false,true,false,true}},
+                {'6',new List<bool>{false,false,true,true,false,true,true,false}},
+                {'7',new List<bool>{false,false,true,true,false,true,true,true}},
+                {'8',new List<bool>{false,false,true,true,true,false,false,false}},
+                {'9',new List<bool>{false,false,true,true,true,false,false,true}},
+                {':',new List<bool>{false,false,true,true,true,false,true,false}},
+                {';',new List<bool>{false,false,true,true,true,false,true,true}},
+                {'<',new List<bool>{false,false,true,true,true,true,false,false}},
+                {'=',new List<bool>{false,false,true,true,true,true,false,true}},
+                {'>',new List<bool>{false,false,true,true,true,true,true,false}},
+                {'?',new List<bool>{false,false,true,true,true,true,true,true}},
+                {'@',new List<bool>{false,true,false,false,false,false,false,false}},
+                {'A',new List<bool>{false,true,false,false,false,false,false,true}},
+                {'B',new List<bool>{false,true,false,false,false,false,true,false}},
+                {'C',new List<bool>{false,true,false,false,false,false,true,true}},
+                {'D',new List<bool>{false,true,false,false,false,true,false,false}},
+                {'E',new List<bool>{false,true,false,false,false,true,false,true}},
+                {'F',new List<bool>{false,true,false,false,false,true,true,false}},
+                {'G',new List<bool>{false,true,false,false,false,true,true,true}},
+                {'H',new List<bool>{false,true,false,false,true,false,false,false}},
+                {'I',new List<bool>{false,true,false,false,true,false,false,true}},
+                {'J',new List<bool>{false,true,false,false,true,false,true,false}},
+                {'K',new List<bool>{false,true,false,false,true,false,true,true}},
+                {'L',new List<bool>{false,true,false,false,true,true,false,false}},
+                {'M',new List<bool>{false,true,false,false,true,true,false,true}},
+                {'N',new List<bool>{false,true,false,false,true,true,true,false}},
+                {'O',new List<bool>{false,true,false,false,true,true,true,true}},
+                {'P',new List<bool>{false,true,false,true,false,false,false,false}},
+                {'Q',new List<bool>{false,true,false,true,false,false,false,true}},
+                {'R',new List<bool>{false,true,false,true,false,false,true,false}},
+                {'S',new List<bool>{false,true,false,true,false,false,true,true}},
+                {'T',new List<bool>{false,true,false,true,false,true,false,false}},
+                {'U',new List<bool>{false,true,false,true,false,true,false,true}},
+                {'V',new List<bool>{false,true,false,true,false,true,true,false}},
+                {'W',new List<bool>{false,true,false,true,false,true,true,true}},
+                {'X',new List<bool>{false,true,false,true,true,false,false,false}},
+                {'Y',new List<bool>{false,true,false,true,true,false,false,true}},
+                {'Z',new List<bool>{false,true,false,true,true,false,true,false}},
+                {'[',new List<bool>{false,true,false,true,true,false,true,true}},
+                {'\\',new List<bool>{false,true,false,true,true,true,false,false}},
+                {']',new List<bool>{false,true,false,true,true,true,false,true}},
+                {'a',new List<bool>{false,true,true,false,false,false,false,true}},
+                {'b',new List<bool>{false,true,true,false,false,false,true,false}},
+                {'c',new List<bool>{false,true,true,false,false,false,true,true}},
+                {'d',new List<bool>{false,true,true,false,false,true,false,false}},
+                {'e',new List<bool>{false,true,true,false,false,true,false,true}},
+                {'f',new List<bool>{false,true,true,false,false,true,true,false}},
+                {'g',new List<bool>{false,true,true,false,false,true,true,true}},
+                {'h',new List<bool>{false,true,true,false,true,false,false,false}},
+                {'i',new List<bool>{false,true,true,false,true,false,false,true}},
+                {'j',new List<bool>{false,true,true,false,true,false,true,false}},
+                {'k',new List<bool>{false,true,true,false,true,false,true,true}},
+                {'l',new List<bool>{false,true,true,false,true,true,false,false}},
+                {'m',new List<bool>{false,true,true,false,true,true,false,true}},
+                {'n',new List<bool>{false,true,true,false,true,true,true,false}},
+                {'o',new List<bool>{false,true,true,false,true,true,true,true}},
+                {'p',new List<bool>{false,true,true,true,false,false,false,false}},
+                {'q',new List<bool>{false,true,true,true,false,false,false,true}},
+                {'r',new List<bool>{false,true,true,true,false,false,true,false}},
+                {'s',new List<bool>{false,true,true,true,false,false,true,true}},
+                {'t',new List<bool>{false,true,true,true,false,true,false,false}},
+                {'u',new List<bool>{false,true,true,true,false,true,false,true}},
+                {'v',new List<bool>{false,true,true,true,false,true,true,false}},
+                {'w',new List<bool>{false,true,true,true,false,true,true,true}},
+                {'x',new List<bool>{false,true,true,true,true,false,false,false}},
+                {'y',new List<bool>{false,true,true,true,true,false,false,true}},
+                {'z',new List<bool>{false,true,true,true,true,false,true,false}},
+                {'{',new List<bool>{false,true,true,true,true,false,true,true}},
+                {'}',new List<bool>{false,true,true,true,true,true,false,true}},
+                {'|',new List<bool>{false,true,true,true,true,true,true,false}}
+            };
+        }
+    }
+}
+------
+using NAudio.Wave;
+using System;
+using System.Diagnostics;
+using System.IO;
+
+namespace Core.AudioGeneration
+{
+    public class AudioGenerator : IAudioGenerator, IDisposable
+    {
+        private WaveFileWriter _waveFileWriter;
+        private int _sampleRate;
+
+        public AudioGenerator(Stream outputStream, int sampleRate = 88200)
+        {
+            if (outputStream == null)
+            {
+                throw new ArgumentNullException(nameof(outputStream));
+            }
+
+            _waveFileWriter = new WaveFileWriter(outputStream, WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, 1));
+            _sampleRate = sampleRate;
+        }
+
+        public AudioGenerator(string filename, int sampleRate = 88200)
+            : this(new StreamWriter(filename).BaseStream, sampleRate) {}
+
+        public void AddInterval(int frequency, double intervalMilliseconds)
+        {
+            int sampleCount = (int)Math.Ceiling(intervalMilliseconds / 1000.0 * _sampleRate);
+
+            var samples = GenerateSamples(frequency, sampleCount, _sampleRate);
+
+            _waveFileWriter.WriteSamples(samples, 0, samples.Length);
+
+            _waveFileWriter.Flush();
+        }
+
+        public float[] GenerateSamples(int frequency, int sampleCount, int sampleRate)
+        {
+            // TODO: How to determine best value for amplitude?
+            var amplitude = 100.0f;
+
+            var samples = new float[sampleCount];
+            for (int i = 0; i < sampleCount; i++)
+            {
+                samples[i] = (float)(amplitude * Math.Sin((2 * Math.PI * i * frequency) / sampleRate));
+            }
+
+            return samples;
+        }
+
+        public void Dispose()
+        {
+            _waveFileWriter.Dispose();
+        }
+    }
+}
+---
+using System;
+using System.Collections.Generic;
+
+namespace Core.AudioGeneration
+{
+    public class FskAudioGenerator : IFskAudioGenerator
+    {
+        private IAudioGenerator _audioGenerator;
+
+        public FskAudioGenerator(IAudioGenerator audioGenerator)
+        {
+            if (audioGenerator == null)
+            {
+                throw new ArgumentNullException(nameof(audioGenerator));
+            }
+
+            _audioGenerator = audioGenerator;
+        }
+
+        public void GenerateAudio(double baudRate, int spaceFrequency, int markFrequency, ICollection<bool> bits)
+        {
+            double intervalLengthInMilliseconds = 1000.0 / baudRate;
+
+            foreach (var bit in bits)
+            {
+                int frequency = spaceFrequency;
+                if (bit == true)
+                {
+                    frequency = markFrequency;
+                }
+
+                _audioGenerator.AddInterval(frequency, intervalLengthInMilliseconds);
+            }
+        }
+    }
+}
+---
+namespace Core.AudioGeneration
+{
+    public interface IAudioGenerator
+    {
+        void AddInterval(int frequency, double intervalMilliseconds);
+        float[] GenerateSamples(int frequency, int sampleCount, int sampleRate);
+    }
+}
+---
+using System.Collections.Generic;
+
+namespace Core.AudioGeneration
+{
+    public interface IFskAudioGenerator
+    {
+        void GenerateAudio(double baudRate, int spaceFrequency, int markFrequency, ICollection<bool> bits);
+    }
+}
+------
+using Core.AudioGeneration;
+using NAudio.Wave;
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+
+namespace Core.AudioAnalysis
+{
+    public class AudioAnalyzer : IAudioAnalyzer
+    {
+        public double FileLengthInMilliseconds { get; }
+        public int BoostFrequencyAmount { get; private set; }
+
+        private float[] _samples;
+        private int _sampleRate;
+        private int _bitsPerSample;
+        private long _fileLengthInBytes;
+        private IAudioGenerator _audioGenerator;
+
+        public AudioAnalyzer(Stream inputStream, IAudioGenerator audioGenerator, int boostFrequency = 0, bool play = false, int? playTime = null)
+        {
+            if (inputStream == null)
+            {
+                throw new ArgumentNullException(nameof(inputStream));
+            }
+
+            if (audioGenerator == null)
+            {
+                throw new ArgumentNullException(nameof(audioGenerator));
+            }
+
+            inputStream.Position = 0;
+
+            var reader = new WaveFileReader(inputStream);
+
+            _sampleRate = reader.WaveFormat.SampleRate;
+            _bitsPerSample = reader.WaveFormat.BitsPerSample;
+            _fileLengthInBytes = reader.Length;
+            _audioGenerator = audioGenerator;
+            BoostFrequencyAmount = boostFrequency;
+
+            if (play == true)
+            {
+                Play(inputStream, playTime);
+            }
+
+            var buffer = new byte[reader.Length];
+            var read = reader.Read(buffer, 0, buffer.Length);
+            _samples = new float[(int)Math.Ceiling(read / 4.0)];
+
+            FileLengthInMilliseconds = _samples.Length / (double)_sampleRate * 1000.0;
+
+            Buffer.BlockCopy(buffer, 0, _samples, 0, read);
+
+            if (boostFrequency != 0)
+            {
+                BoostFrequency(boostFrequency);
+            }
+        }
+
+        public AudioAnalyzer(string filename, IAudioGenerator audioGenerator, int boostFrequency = 0, bool play = false,
+            int? playTime = null)
+            : this(new StreamReader(filename).BaseStream, audioGenerator, boostFrequency, play, playTime) { }
+
+        public SamplingResult GetSamples(double? startMilliseconds, double? endMilliseconds)
+        {
+            if (startMilliseconds == null)
+            {
+                startMilliseconds = 0;
+                endMilliseconds = FileLengthInMilliseconds;
+            }
+
+            endMilliseconds = endMilliseconds > FileLengthInMilliseconds ? FileLengthInMilliseconds : endMilliseconds;
+
+            var desiredSampleLengthInMilliseconds = endMilliseconds - startMilliseconds;
+            var firstSampleNumber = (int)(startMilliseconds / 1000.0 * _sampleRate);
+            var lastSampleNumber = (int)(endMilliseconds / 1000.0 * _sampleRate);
+            var desiredNumberOfSamples = lastSampleNumber - firstSampleNumber;
+
+            var desiredSamples = new float[desiredNumberOfSamples];
+            var j = 0;
+            for (var i = firstSampleNumber; i < lastSampleNumber; i++)
+            {
+                desiredSamples[j] = _samples[i];
+                j++;
+            }
+
+            return new SamplingResult
+            {
+                BitsPerSample = _bitsPerSample,
+                SampleRate = _sampleRate,
+                FileLengthInBytes = (int)_fileLengthInBytes,
+                FileLengthInMilliseconds = FileLengthInMilliseconds,
+                Samples = desiredSamples
+            };
+        }
+
+        public void BoostFrequency(int frequency)
+        {
+            var boostSamples = _audioGenerator.GenerateSamples(frequency, _samples.Length, _sampleRate);
+
+            for (var i = 0; i < _samples.Length; i++)
+            {
+                _samples[i] = _samples[i] * boostSamples[i];
+            }
+        }
+
+        public static void Play(string filename, int lengthInSeconds)
+        {
+            if (string.IsNullOrEmpty(filename))
+            {
+                throw new ArgumentNullException(nameof(filename), "filename must not be null or empty");
+            }
+
+            using (var inputStream = new FileStream(filename, FileMode.Open))
+            {
+                Play(inputStream, lengthInSeconds);
+            }
+        }
+
+        public static void Play(Stream inputStream, int? playTime)
+        {
+            if (inputStream == null)
+            {
+                throw new ArgumentNullException(nameof(inputStream));
+            }
+
+            var previousPosition = inputStream.Position;
+            inputStream.Position = 0;
+
+            using (var reader = new WaveFileReader(inputStream))
+            using (var waveOut = new WaveOut())
+            {
+                waveOut.Init(reader);
+                waveOut.Volume = 1.0F;
+                waveOut.Play();
+                Thread.Sleep(playTime == null ? 1000 : playTime.Value);
+            }
+
+            inputStream.Position = previousPosition;
+        }
+    }
+}
+---
+namespace Core.AudioAnalysis
+{
+    public interface IAudioAnalyzer
+    {
+        double FileLengthInMilliseconds { get; }
+        int BoostFrequencyAmount { get; }
+        SamplingResult GetSamples(double? startMilliseconds = null, double? endMilliseconds = null);
+        void BoostFrequency(int frequency);
+    }
+}
+---
+using System.Collections.Generic;
+
+namespace Core.AudioAnalysis
+{
+    public class SamplingResult
+    {
+        public IList<float> Samples { get; set; }
+        public int SampleRate { get; set; }
+        public int BitsPerSample { get; set; }
+        public double FileLengthInMilliseconds { get; set; }
+        public int FileLengthInBytes { get; set; }
+    }
+}
+
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+using Core.BinaryFskAnalysis;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using System.Text;
+using System.Windows.Forms;
+
+namespace Gui
+{
+    public partial class Form1 : Form
+    {
+        private IList<AnalysisResultEventArgs> _analysisResults;
+
+        public Form1()
+        {
+            InitializeComponent();
+
+            mainDataGrid.AutoGenerateColumns = false;
+            mainDataGrid.ColumnCount = 5;
+            mainDataGrid.ColumnHeadersDefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+
+            mainDataGrid.Columns[0].Name = "Boost (Hz)";
+            mainDataGrid.Columns[0].HeaderText = "Boost (Hz)";
+            mainDataGrid.Columns[0].DataPropertyName = "BoostFrequencyAmount";
+            mainDataGrid.Columns[0].Frozen = false;
+            mainDataGrid.Columns[0].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+
+            mainDataGrid.Columns[1].Name = "Freq. diff. (Hz)";
+            mainDataGrid.Columns[1].HeaderText = "Freq. diff. (Hz)";
+            mainDataGrid.Columns[1].DataPropertyName = "AverageFrequencyDifference";
+            mainDataGrid.Columns[1].Frozen = false;
+            mainDataGrid.Columns[1].DefaultCellStyle.Format = "0.0";
+            mainDataGrid.Columns[1].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+
+            mainDataGrid.Columns[2].Name = "# miss";
+            mainDataGrid.Columns[2].HeaderText = "# miss";
+            mainDataGrid.Columns[2].DataPropertyName = "NumberOfMissedFrequencies";
+            mainDataGrid.Columns[2].Frozen = false;
+            mainDataGrid.Columns[2].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+
+            mainDataGrid.Columns[3].Name = "Output";
+            mainDataGrid.Columns[3].HeaderText = "Output";
+            mainDataGrid.Columns[3].DataPropertyName = "ResultingString";
+            mainDataGrid.Columns[3].Frozen = false;
+            mainDataGrid.Columns[3].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+
+            mainDataGrid.Columns[4].Name = "Match?";
+            mainDataGrid.Columns[4].HeaderText = "Match?";
+            mainDataGrid.Columns[4].DataPropertyName = "Matched";
+            mainDataGrid.Columns[4].Frozen = false;
+            mainDataGrid.Columns[4].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+
+            _analysisResults = new BindingList<AnalysisResultEventArgs>();
+            mainDataGrid.DataSource = _analysisResults;
+
+            backgroundWorker1.ProgressChanged += BackgroundWorker1_ProgressChanged;
+        }
+
+        private void startButton_Click(object sender, EventArgs e)
+        {
+            startButton.Enabled = false;
+            exportToCsvButton.Enabled = false;
+            _analysisResults.Clear();
+            backgroundWorker1.RunWorkerAsync();
+        }
+
+        private void backgroundWorker1_DoWork(object sender, System.ComponentModel.DoWorkEventArgs e)
+        {
+            var spaceFrequencyStringValue = spaceFrequency.Text;
+            var markFrequencyStringValue = markFrequency.Text;
+            var baudRateStringValue = baudRate.Text;
+
+            var boostStartStringValue = boostStart.Text;
+            var boostIncrementStringValue = boostIncrement.Text;
+            var boostEndStringValue = boostEnd.Text;
+
+            if (string.IsNullOrWhiteSpace(spaceFrequencyStringValue))
+            {
+                MessageBox.Show("Space frequency cannot be empty", "Input required");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(markFrequencyStringValue))
+            {
+                MessageBox.Show("Mark frequency cannot be empty", "Input required");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(baudRateStringValue))
+            {
+                MessageBox.Show("Baud rate cannot be empty", "Input required");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(boostStartStringValue))
+            {
+                MessageBox.Show("Boost start cannot be empty", "Input required");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(boostIncrementStringValue))
+            {
+                MessageBox.Show("Boost increment cannot be empty", "Input required");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(boostEndStringValue))
+            {
+                MessageBox.Show("Boost end cannot be empty", "Input required");
+                return;
+            }
+
+            var spaceFrequencyDoubleValue = double.Parse(spaceFrequencyStringValue);
+            var markFrequencyDoubleValue = double.Parse(markFrequencyStringValue);
+            var baudRateIntValue = int.Parse(baudRateStringValue);
+
+            double boostStartDoubleValue = double.Parse(boostStartStringValue);
+            double boostIncrementDoubleValue = double.Parse(boostIncrementStringValue);
+            double boostEndDoubleValue = double.Parse(boostEndStringValue);
+
+            var testRunner = new TestRunner();
+            testRunner.FskAnalyzer.AnalysisCompleted += AnalysisCompletedHandler;
+            testRunner.Run(spaceFrequencyDoubleValue, markFrequencyDoubleValue, baudRateIntValue,
+                boostStartDoubleValue, boostIncrementDoubleValue, boostEndDoubleValue);
+        }
+
+        private void BackgroundWorker1_ProgressChanged(object sender, ProgressChangedEventArgs e)
+        {
+            var analysisResult = (AnalysisResultEventArgs)e.UserState;
+            _analysisResults.Add(analysisResult);
+
+            if (analysisResult.Matched == true)
+            {
+                mainDataGrid.Rows[mainDataGrid.RowCount - 1].Cells[4].Style.BackColor = System.Drawing.Color.Green;
+            }
+            else
+            {
+                mainDataGrid.Rows[mainDataGrid.RowCount - 1].Cells[4].Style.BackColor = System.Drawing.Color.Red;
+            }
+
+            mainDataGrid.FirstDisplayedScrollingRowIndex = mainDataGrid.RowCount - 1;
+        }
+
+        private void backgroundWorker1_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
+        {
+            mainDataGrid.FirstDisplayedScrollingRowIndex = 0;
+            startButton.Enabled = true;
+            exportToCsvButton.Enabled = true;
+        }
+
+        private void AnalysisCompletedHandler(object sender, AnalysisResultEventArgs e)
+        {
+            backgroundWorker1.ReportProgress(0, e);
+        }
+
+        private void exportToCsvButton_Click(object sender, EventArgs e)
+        {
+            SaveCsvFile();
+        }
+
+        private void SaveCsvFile()
+        {
+            var csvStringBuilder = new StringBuilder();
+
+            var headers = mainDataGrid.Columns.Cast<DataGridViewColumn>();
+            csvStringBuilder.AppendLine(string.Join(",", headers.Select(column => "\"" + column.HeaderText + "\"").ToArray()));
+
+            foreach (DataGridViewRow row in mainDataGrid.Rows)
+            {
+                var cells = row.Cells.Cast<DataGridViewCell>();
+                csvStringBuilder.AppendLine(string.Join(",", cells.Select(cell => "\"" + cell.Value.ToString().Replace("\"", "") + "\"").ToArray()));
+            }
+
+            var saveFileDialog = new SaveFileDialog();
+            saveFileDialog.Filter = "CSV|*.csv";
+            saveFileDialog.Title = "Save CSV file";
+            saveFileDialog.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+            saveFileDialog.ShowDialog();
+
+            if (!string.IsNullOrEmpty(saveFileDialog.FileName))
+            {
+                var fileStream = (System.IO.FileStream)saveFileDialog.OpenFile();
+                fileStream.Write(Encoding.ASCII.GetBytes(csvStringBuilder.ToString()), 0, csvStringBuilder.ToString().Count());
+                fileStream.Close();
+            }
+        }
+
+        private void mainDataGrid_CellContentClick(object sender, DataGridViewCellEventArgs e) {}
+        private void form1BindingSource_CurrentChanged(object sender, EventArgs e) {}
+        private void Form1_Load(object sender, EventArgs e) {}
+    }
+}
+---
+namespace Gui
+{
+    partial class Form1
+    {
+        /// <summary>
+        /// Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary>
+        /// Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Windows Form Designer generated code
+
+        /// <summary>
+        /// Required method for Designer support - do not modify
+        /// the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            this.backgroundWorker1 = new System.ComponentModel.BackgroundWorker();
+            this.markFrequency = new System.Windows.Forms.TextBox();
+            this.baudRate = new System.Windows.Forms.TextBox();
+            this.spaceFrequency = new System.Windows.Forms.TextBox();
+            this.baudRateLabel = new System.Windows.Forms.Label();
+            this.spaceFrequencyLabel = new System.Windows.Forms.Label();
+            this.markFrequencyLabel = new System.Windows.Forms.Label();
+            this.boostStartLabel = new System.Windows.Forms.Label();
+            this.boostStart = new System.Windows.Forms.TextBox();
+            this.boostIncrementLabel = new System.Windows.Forms.Label();
+            this.boostIncrement = new System.Windows.Forms.TextBox();
+            this.boostEndLabel = new System.Windows.Forms.Label();
+            this.boostEnd = new System.Windows.Forms.TextBox();
+            this.startButton = new System.Windows.Forms.Button();
+            this.mainDataGrid = new System.Windows.Forms.DataGridView();
+            this.exportToCsvButton = new System.Windows.Forms.Button();
+            ((System.ComponentModel.ISupportInitialize)(this.mainDataGrid)).BeginInit();
+            this.SuspendLayout();
+            // 
+            // backgroundWorker1
+            // 
+            this.backgroundWorker1.WorkerReportsProgress = true;
+            this.backgroundWorker1.DoWork += new System.ComponentModel.DoWorkEventHandler(this.backgroundWorker1_DoWork);
+            this.backgroundWorker1.RunWorkerCompleted += new System.ComponentModel.RunWorkerCompletedEventHandler(this.backgroundWorker1_RunWorkerCompleted);
+            // 
+            // markFrequency
+            // 
+            this.markFrequency.Location = new System.Drawing.Point(283, 383);
+            this.markFrequency.Name = "markFrequency";
+            this.markFrequency.Size = new System.Drawing.Size(100, 20);
+            this.markFrequency.TabIndex = 2;
+            this.markFrequency.Text = "1270";
+            // 
+            // baudRate
+            // 
+            this.baudRate.Location = new System.Drawing.Point(480, 383);
+            this.baudRate.Name = "baudRate";
+            this.baudRate.Size = new System.Drawing.Size(100, 20);
+            this.baudRate.TabIndex = 3;
+            this.baudRate.Text = "50";
+            // 
+            // spaceFrequency
+            // 
+            this.spaceFrequency.Location = new System.Drawing.Point(80, 383);
+            this.spaceFrequency.Name = "spaceFrequency";
+            this.spaceFrequency.Size = new System.Drawing.Size(100, 20);
+            this.spaceFrequency.TabIndex = 1;
+            this.spaceFrequency.Text = "1070";
+            // 
+            // baudRateLabel
+            // 
+            this.baudRateLabel.AutoSize = true;
+            this.baudRateLabel.Location = new System.Drawing.Point(421, 386);
+            this.baudRateLabel.Name = "baudRateLabel";
+            this.baudRateLabel.Size = new System.Drawing.Size(53, 13);
+            this.baudRateLabel.TabIndex = 99;
+            this.baudRateLabel.Text = "Baud rate";
+            // 
+            // spaceFrequencyLabel
+            // 
+            this.spaceFrequencyLabel.AutoSize = true;
+            this.spaceFrequencyLabel.Location = new System.Drawing.Point(12, 386);
+            this.spaceFrequencyLabel.Name = "spaceFrequencyLabel";
+            this.spaceFrequencyLabel.Size = new System.Drawing.Size(62, 13);
+            this.spaceFrequencyLabel.TabIndex = 99;
+            this.spaceFrequencyLabel.Text = "Space freq.";
+            // 
+            // markFrequencyLabel
+            // 
+            this.markFrequencyLabel.AutoSize = true;
+            this.markFrequencyLabel.Location = new System.Drawing.Point(222, 386);
+            this.markFrequencyLabel.Name = "markFrequencyLabel";
+            this.markFrequencyLabel.Size = new System.Drawing.Size(55, 13);
+            this.markFrequencyLabel.TabIndex = 99;
+            this.markFrequencyLabel.Text = "Mark freq.";
+            // 
+            // boostStartLabel
+            // 
+            this.boostStartLabel.AutoSize = true;
+            this.boostStartLabel.Location = new System.Drawing.Point(12, 424);
+            this.boostStartLabel.Name = "boostStartLabel";
+            this.boostStartLabel.Size = new System.Drawing.Size(57, 13);
+            this.boostStartLabel.TabIndex = 99;
+            this.boostStartLabel.Text = "Boost start";
+            // 
+            // boostStart
+            // 
+            this.boostStart.Location = new System.Drawing.Point(80, 421);
+            this.boostStart.Name = "boostStart";
+            this.boostStart.Size = new System.Drawing.Size(100, 20);
+            this.boostStart.TabIndex = 4;
+            this.boostStart.Text = "0";
+            // 
+            // boostIncrementLabel
+            // 
+            this.boostIncrementLabel.AutoSize = true;
+            this.boostIncrementLabel.Location = new System.Drawing.Point(222, 424);
+            this.boostIncrementLabel.Name = "boostIncrementLabel";
+            this.boostIncrementLabel.Size = new System.Drawing.Size(54, 13);
+            this.boostIncrementLabel.TabIndex = 99;
+            this.boostIncrementLabel.Text = "Boost inc.";
+            // 
+            // boostIncrement
+            // 
+            this.boostIncrement.Location = new System.Drawing.Point(283, 421);
+            this.boostIncrement.Name = "boostIncrement";
+            this.boostIncrement.Size = new System.Drawing.Size(100, 20);
+            this.boostIncrement.TabIndex = 5;
+            this.boostIncrement.Text = "100";
+            // 
+            // boostEndLabel
+            // 
+            this.boostEndLabel.AutoSize = true;
+            this.boostEndLabel.Location = new System.Drawing.Point(421, 424);
+            this.boostEndLabel.Name = "boostEndLabel";
+            this.boostEndLabel.Size = new System.Drawing.Size(55, 13);
+            this.boostEndLabel.TabIndex = 99;
+            this.boostEndLabel.Text = "Boost end";
+            // 
+            // boostEnd
+            // 
+            this.boostEnd.Location = new System.Drawing.Point(480, 421);
+            this.boostEnd.Name = "boostEnd";
+            this.boostEnd.Size = new System.Drawing.Size(100, 20);
+            this.boostEnd.TabIndex = 6;
+            this.boostEnd.Text = "5000";
+            // 
+            // startButton
+            // 
+            this.startButton.Location = new System.Drawing.Point(600, 386);
+            this.startButton.Name = "startButton";
+            this.startButton.Size = new System.Drawing.Size(111, 51);
+            this.startButton.TabIndex = 7;
+            this.startButton.Text = "Analyze";
+            this.startButton.UseVisualStyleBackColor = true;
+            this.startButton.Click += new System.EventHandler(this.startButton_Click);
+            // 
+            // mainDataGrid
+            // 
+            this.mainDataGrid.AllowUserToAddRows = false;
+            this.mainDataGrid.AllowUserToDeleteRows = false;
+            this.mainDataGrid.ColumnHeadersHeightSizeMode = System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode.AutoSize;
+            this.mainDataGrid.EditMode = System.Windows.Forms.DataGridViewEditMode.EditProgrammatically;
+            this.mainDataGrid.Location = new System.Drawing.Point(12, 12);
+            this.mainDataGrid.Name = "mainDataGrid";
+            this.mainDataGrid.ReadOnly = true;
+            this.mainDataGrid.RowHeadersVisible = false;
+            this.mainDataGrid.ScrollBars = System.Windows.Forms.ScrollBars.Vertical;
+            this.mainDataGrid.Size = new System.Drawing.Size(520, 350);
+            this.mainDataGrid.TabIndex = 100;
+            this.mainDataGrid.TabStop = false;
+            this.mainDataGrid.CellContentClick += new System.Windows.Forms.DataGridViewCellEventHandler(this.mainDataGrid_CellContentClick);
+            // 
+            // exportToCsvButton
+            // 
+            this.exportToCsvButton.Enabled = false;
+            this.exportToCsvButton.Location = new System.Drawing.Point(726, 386);
+            this.exportToCsvButton.Name = "exportToCsvButton";
+            this.exportToCsvButton.Size = new System.Drawing.Size(111, 51);
+            this.exportToCsvButton.TabIndex = 101;
+            this.exportToCsvButton.Text = "Export to CSV";
+            this.exportToCsvButton.UseVisualStyleBackColor = true;
+            this.exportToCsvButton.Click += new System.EventHandler(this.exportToCsvButton_Click);
+            // 
+            // Form1
+            // 
+            this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
+            this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
+            this.ClientSize = new System.Drawing.Size(856, 461);
+            this.Controls.Add(this.exportToCsvButton);
+            this.Controls.Add(this.mainDataGrid);
+            this.Controls.Add(this.startButton);
+            this.Controls.Add(this.boostEnd);
+            this.Controls.Add(this.boostEndLabel);
+            this.Controls.Add(this.boostIncrement);
+            this.Controls.Add(this.boostIncrementLabel);
+            this.Controls.Add(this.boostStart);
+            this.Controls.Add(this.boostStartLabel);
+            this.Controls.Add(this.markFrequencyLabel);
+            this.Controls.Add(this.spaceFrequencyLabel);
+            this.Controls.Add(this.baudRateLabel);
+            this.Controls.Add(this.spaceFrequency);
+            this.Controls.Add(this.baudRate);
+            this.Controls.Add(this.markFrequency);
+            this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedSingle;
+            this.MaximizeBox = false;
+            this.Name = "Form1";
+            this.ShowIcon = false;
+            this.Text = "Signal Analyzer";
+            this.Load += new System.EventHandler(this.Form1_Load);
+            ((System.ComponentModel.ISupportInitialize)(this.mainDataGrid)).EndInit();
+            this.ResumeLayout(false);
+            this.PerformLayout();
+
+        }
+
+        #endregion
+        private System.ComponentModel.BackgroundWorker backgroundWorker1;
+        private System.Windows.Forms.TextBox markFrequency;
+        private System.Windows.Forms.TextBox baudRate;
+        private System.Windows.Forms.TextBox spaceFrequency;
+        private System.Windows.Forms.Label baudRateLabel;
+        private System.Windows.Forms.Label spaceFrequencyLabel;
+        private System.Windows.Forms.Label markFrequencyLabel;
+        private System.Windows.Forms.Label boostStartLabel;
+        private System.Windows.Forms.TextBox boostStart;
+        private System.Windows.Forms.Label boostIncrementLabel;
+        private System.Windows.Forms.TextBox boostIncrement;
+        private System.Windows.Forms.Label boostEndLabel;
+        private System.Windows.Forms.TextBox boostEnd;
+        private System.Windows.Forms.Button startButton;
+        private System.Windows.Forms.DataGridView mainDataGrid;
+        private System.Windows.Forms.Button exportToCsvButton;
+    }
+}
+
+---
+using System;
+using System.Windows.Forms;
+
+namespace Gui
+{
+    static class Program
+    {
+        /// <summary>
+        /// The main entry point for the application.
+        /// </summary>
+        [STAThread]
+        static void Main()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new Form1());
+        }
+    }
+}
+---
+using Core.AudioAnalysis;
+using Core.AudioGeneration;
+using Core.BinaryData;
+using Core.BinaryFskAnalysis;
+using System;
+using System.Diagnostics;
+using System.IO;
+
+namespace Gui
+{
+    public class TestRunner
+    {
+        public IBinaryFskAnalyzer FskAnalyzer { get; private set; }
+        private MemoryStream _audioStream;
+        private IAudioGenerator _audioGenerator;
+        private BinaryFskAnalyzerSettings _binaryFskAnalyzerSettings;
+        private IFskAudioGenerator _fskAudioGenerator;
+        private IAudioAnalyzer _audioAnalyzer;
+        private IFrequencyDetector _frequencyDetector;
+        private string _testString = "ABCDEFGHIJK";
+
+        public TestRunner(BinaryFskAnalyzerSettings binaryFskAnalyzerSettings = null,
+            IFrequencyDetector frequencyDetector = null)
+        {
+            _audioStream = new MemoryStream();
+            _audioGenerator = new AudioGenerator(_audioStream);
+            _fskAudioGenerator = new FskAudioGenerator(_audioGenerator);
+            _binaryFskAnalyzerSettings = binaryFskAnalyzerSettings != null ? binaryFskAnalyzerSettings : new Bell103BinaryFskAnalyzerSettings();
+            var bitManipulator = new BitManipulator();
+            _fskAudioGenerator.GenerateAudio(_binaryFskAnalyzerSettings.BaudRate, _binaryFskAnalyzerSettings.SpaceFrequency,
+                _binaryFskAnalyzerSettings.MarkFrequency, bitManipulator.StringToBits(_testString));
+            _audioAnalyzer = new AudioAnalyzer(_audioStream, _audioGenerator);
+            _frequencyDetector = frequencyDetector != null ? frequencyDetector : new ZeroCrossingsFrequencyDetector();
+            FskAnalyzer = new BinaryFskAnalyzer(_audioAnalyzer, _frequencyDetector, _binaryFskAnalyzerSettings);
+        }
+
+        public void Run(double spaceFrequency, double markFrequency, int baudRate, double boostStartFrequency,
+            double boostIncrement, double boostEndFrequency)
+        {
+            var bitManipulator = new BitManipulator();
+            var bits = bitManipulator.StringToBits(_testString);
+            Debug.WriteLine($"Length of string in bits: {bits.Count}");
+
+            _binaryFskAnalyzerSettings = new Bell103BinaryFskAnalyzerSettings
+            {
+                SpaceFrequency = (int)spaceFrequency,
+                MarkFrequency = (int)markFrequency,
+                BaudRate = baudRate
+            };
+
+            _audioStream = new MemoryStream();
+
+            _audioGenerator = new AudioGenerator(_audioStream);
+            _fskAudioGenerator = new FskAudioGenerator(_audioGenerator);
+            _fskAudioGenerator.GenerateAudio(_binaryFskAnalyzerSettings.BaudRate,
+                _binaryFskAnalyzerSettings.SpaceFrequency, _binaryFskAnalyzerSettings.MarkFrequency, bits);
+
+            var audioLengthInMillisecondsSeconds = (int)(bits.Count * 1000.0 / _binaryFskAnalyzerSettings.BaudRate);
+            Debug.WriteLine($"Length of audio in seconds: {audioLengthInMillisecondsSeconds / 1000.0:N1}");
+            Debug.WriteLine(string.Empty);
+
+            for (var loopBoostFrequency = boostStartFrequency; loopBoostFrequency <= boostEndFrequency;
+                loopBoostFrequency += boostIncrement)
+            {
+                _binaryFskAnalyzerSettings = new Bell103BinaryFskAnalyzerSettings
+                {
+                    SpaceFrequency = (int)spaceFrequency,
+                    MarkFrequency = (int)markFrequency,
+                    BaudRate = baudRate
+                };
+
+                _audioStream = new MemoryStream();
+                _audioGenerator = new AudioGenerator(_audioStream);
+                _fskAudioGenerator = new FskAudioGenerator(_audioGenerator);
+                _fskAudioGenerator.GenerateAudio(_binaryFskAnalyzerSettings.BaudRate,
+                    _binaryFskAnalyzerSettings.SpaceFrequency, _binaryFskAnalyzerSettings.MarkFrequency, bits);
+
+                _binaryFskAnalyzerSettings = new Bell103BinaryFskAnalyzerSettings
+                {
+                    SpaceFrequency = (int)(spaceFrequency + loopBoostFrequency),
+                    MarkFrequency = (int)(markFrequency + loopBoostFrequency),
+                    BaudRate = baudRate,
+                    FrequencyDeviationTolerance = 100
+                };
+
+                _audioAnalyzer = new AudioAnalyzer(_audioStream, _audioGenerator, (int)loopBoostFrequency);
+
+                FskAnalyzer.Initialize(_audioAnalyzer, new ZeroCrossingsFrequencyDetector(), _binaryFskAnalyzerSettings);
+                FskAnalyzer.AnalyzeSignal(_testString);
+            }
+        }
+    }
+}
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+using Core.AudioAnalysis;
+using Core.AudioGeneration;
+using Core.BinaryData;
+using Core.BinaryFskAnalysis;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Moq;
+using System;
+using System.IO;
+using System.Text;
+using Tests.Properties;
+
+namespace Tests
+{
+    [TestClass]
+    public class BinaryFskAnalyzerTests
+    {
+        private Mock<IAudioAnalyzer> _audioAnalyzer;
+        private Mock<IFrequencyDetector> _frequencyDetector;
+        private BitManipulator _bitManipulator;
+        private BinaryFskAnalyzerSettings _binaryFskAnalyzerSettings;
+
+        [TestInitialize]
+        public void TestInitialize()
+        {
+            _audioAnalyzer = new Mock<IAudioAnalyzer>();
+            _frequencyDetector = new Mock<IFrequencyDetector>();
+            _bitManipulator = new BitManipulator();
+
+            _binaryFskAnalyzerSettings = new BinaryFskAnalyzerSettings
+            {
+                BaudRate = 300.0,
+                SpaceFrequency = 1000,
+                MarkFrequency = 1500
+            };
+        }
+
+        [TestMethod]
+        [ExpectedException(typeof(ArgumentNullException))]
+        public void Constructor_NullAudioAnalyzer_Throws()
+        {
+            new BinaryFskAnalyzer(null, _frequencyDetector.Object, _binaryFskAnalyzerSettings);
+        }
+
+        [TestMethod]
+        [ExpectedException(typeof(ArgumentNullException))]
+        public void Constructor_NullFrequencyDetector_Throws()
+        {
+            new BinaryFskAnalyzer(_audioAnalyzer.Object, null, _binaryFskAnalyzerSettings);
+        }
+
+        [TestMethod]
+        [ExpectedException(typeof(ArgumentNullException))]
+        public void Constructor_NullSettings_Throws()
+        {
+            new BinaryFskAnalyzer(_audioAnalyzer.Object, _frequencyDetector.Object, null);
+        }
+
+        [TestMethod]
+        public void AnalyzeSignal_KnownSignal_ReturnsExpectedValues()
+        {
+            var audioStream = new MemoryStream();
+
+            var audioGenerator = new AudioGenerator(audioStream);
+            var fskAudioGenerator = new FskAudioGenerator(audioGenerator);
+            fskAudioGenerator.GenerateAudio(_binaryFskAnalyzerSettings.BaudRate,
+                _binaryFskAnalyzerSettings.SpaceFrequency, _binaryFskAnalyzerSettings.MarkFrequency,
+                _bitManipulator.StringToBits(Resources.LoremIpsumTestString));
+
+            var audioAnalyzer = new AudioAnalyzer(audioStream, audioGenerator);
+            var binaryFskAnalyzer = (IBinaryFskAnalyzer)new BinaryFskAnalyzer(audioAnalyzer, new ZeroCrossingsFrequencyDetector(), _binaryFskAnalyzerSettings);
+            var bits = binaryFskAnalyzer.AnalyzeSignal();
+
+            var ascii = BitManipulator.BitsToString(bits);
+
+            Assert.AreEqual(Resources.LoremIpsumTestString, ascii);
+        }
+    }
+}
+
+
